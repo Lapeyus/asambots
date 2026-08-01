@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+chats/
+results/
+advanced_results/
+presidencia_data/
+presidencia_analysis/
+campaign_analysis/
+deep_analysis/
