@@ -150,6 +150,28 @@ python3 advanced_analysis.py presidencia_data --output presidencia_analysis
 
 Los comentarios participan en las señales de texto, repetición, plantillas compartidas y actividad entre videos. Cuando fueron obtenidos con `yt-dlp`, su fecha tiene precisión diaria; por seguridad metodológica no se usa como si fuera una hora exacta para medir cadencia o sincronización de segundos. Los chats sí conservan esa dimensión temporal.
 
+Para reutilizar chats crudos descargados anteriormente, indique el directorio con
+`--legacy-chat-dir`. El colector obtiene el `video_id` del nombre
+`__VIDEOID__chat.jsonl`, convierte el contenido al esquema canónico, conserva la
+fuente intacta y registra ambos hashes en el inventario. Por ejemplo, para la
+Asamblea Legislativa:
+
+```bash
+YOUTUBE_RASPADO=1 python3 youtube_channel_collector.py \
+  --channel https://www.youtube.com/@AsambleaCRC \
+  --output-dir asamblea_data --since 2026-05-01 \
+  --legacy-chat-dir chats --catalog-backend ytdlp \
+  --comments-backend ytdlp --limit 0
+```
+
+Si YouTube está temporalmente limitado o solo se desea preparar el inventario
+local, agregue `--legacy-only --no-refresh-catalog --mode chats`. Esta variante
+no hace solicitudes remotas.
+
+Para canales con cientos de videos, `--mode comments --comment-workers 4`
+procesa comentarios en paralelo; las actualizaciones de `inventory.json`
+permanecen serializadas. Use un valor conservador para evitar límites de YouTube.
+
 ## Hipótesis de campaña progobierno
 
 `campaign_evidence.py` separa orientación y coordinación. Ejecuta una prueba estricta sobre apoyo directo al Gobierno y otra más amplia que agrega ataques a oposición o instituciones, sin asumir que estos últimos equivalgan a apoyo:
@@ -166,6 +188,26 @@ python3 campaign_evidence.py presidencia_data --output campaign_analysis \
 ```
 
 Las etiquetas aceptadas son `direct_support`, `ambiguous_support`, `possible_criticism`, `opposition_or_institution_attack` y `other`. El informe nunca interpreta afinidad política por sí sola como prueba de coordinación.
+
+## Estadística y clasificación de contenido
+
+`text_content_analysis.py` asigna varias etiquetas auditables a cada mensaje:
+postura frente al Gobierno, temas, insultos o acusaciones, personas y entidades
+mencionadas, blancos probables de ataques y consignas repetidas. También calcula
+tasas por cuenta y por sesión para no confundir volumen de actividad con
+concentración de lenguaje agresivo.
+
+```bash
+python3 text_content_analysis.py asamblea_data \
+  --output asamblea_text_analysis --validation-per-stratum 100
+```
+
+El resultado principal es `content_report.md`. Los CSV conservan el detalle por
+mensaje, tema, cuenta, sesión, blanco y consigna. Antes de publicar cifras,
+complete una revisión manual en `human_validation_sample.csv`: las reglas pueden
+confundir citas, negaciones, ironía y acusaciones relatadas con ataques del autor.
+Una consigna compartida es una coincidencia textual, no prueba por sí sola de
+automatización o coordinación.
 
 ## Análisis profundo de coincidencias
 

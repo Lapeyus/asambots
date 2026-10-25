@@ -1,7 +1,10 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from campaign_evidence import classify_text
-from bot_detector import normalize_text
+from campaign_evidence import classify_text, coverage
+from bot_detector import Message, normalize_text
 
 
 class CampaignEvidenceTests(unittest.TestCase):
@@ -31,6 +34,17 @@ class CampaignEvidenceTests(unittest.TestCase):
             self.classify("Viva Laura y fuera los corruptos del PLN"),
             "direct_support",
         )
+
+    def test_coverage_prefers_exact_upload_date(self):
+        message = Message("v1", 0, "a1", "Ana", "hola", "hola")
+        row = {
+            "video_id": "v1", "upload_date": "20260501",
+            "published_at": "2026-06-01T00:00:00+00:00",
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "catalog.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+            result = coverage(folder, [message])
+        self.assertEqual(result["earliest_catalog_date"], "2026-05-01")
 
 
 if __name__ == "__main__":

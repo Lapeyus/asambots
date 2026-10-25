@@ -16,6 +16,8 @@ from youtube_channel_collector import (
     discover_channel_ytdlp,
     download_comments_ytdlp,
     hydrate_catalog_dates_ytdlp,
+    discover_legacy_chats,
+    import_legacy_chat,
 )
 
 
@@ -25,6 +27,18 @@ class ChannelCollectorTests(unittest.TestCase):
         self.assertEqual(args.since, "2026-05-01")
         self.assertGreaterEqual(args.until, args.since)
 
+    def test_legacy_only_requires_a_source_directory(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--legacy-only"])
+        args = parse_args(["--legacy-only", "--legacy-chat-dir", "chats"])
+        self.assertTrue(args.legacy_only)
+
+    def test_parallel_worker_counts_must_be_positive(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--comment-workers", "0"])
+        with self.assertRaises(SystemExit):
+            parse_args(["--metadata-workers", "0"])
+
     def test_window_is_inclusive_and_rejects_missing_date(self):
         from datetime import date
         since = date(2026, 5, 1)
@@ -33,6 +47,15 @@ class ChannelCollectorTests(unittest.TestCase):
         self.assertTrue(within_window({"upload_date": "20260731"}, since, until))
         self.assertFalse(within_window({"published_at": "2026-04-30T23:59:59Z"}, since, until))
         self.assertFalse(within_window({}, since, until))
+
+    def test_exact_upload_date_overrides_approximate_published_date(self):
+        from datetime import date
+        entry = {
+            "published_at": "2026-05-01T00:00:00+00:00",
+            "upload_date": "20260423",
+            "date_precision": "exact",
+        }
+        self.assertFalse(within_window(entry, date(2026, 5, 1), date(2026, 8, 1)))
 
     def test_chat_renderer_becomes_canonical(self):
         payload = {"replayChatItemAction": {"videoOffsetTimeMsec": "1250", "actions": [
@@ -59,6 +82,30 @@ class ChannelCollectorTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0].normalized, "hola")
         self.assertEqual(messages[0].session, "video-123")
+
+    def test_legacy_chat_is_discovered_and_imported_without_changing_source(self):
+        payload = {"replayChatItemAction": {"videoOffsetTimeMsec": "1250", "actions": [
+            {"addChatItemAction": {"item": {"liveChatTextMessageRenderer": {
+                "id": "m1", "authorExternalChannelId": "UC1",
+                "authorName": {"simpleText": "@ana"},
+                "message": {"runs": [{"text": "Hola"}]},
+            }}}}
+        ]}}
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "sesion" / "Acta__abcdefghijk__chat.jsonl"
+            source.parent.mkdir()
+            original = json.dumps(payload) + "\n"
+            source.write_text(original, encoding="utf-8")
+            indexed = discover_legacy_chats(root)
+            destination = root / "canonical" / "chat.jsonl"
+            count = import_legacy_chat(indexed["abcdefghijk"], destination, "abcdefghijk")
+            row = json.loads(destination.read_text(encoding="utf-8"))
+            preserved = source.read_text(encoding="utf-8")
+        self.assertEqual(count, 1)
+        self.assertEqual(row["video_id"], "abcdefghijk")
+        self.assertEqual(row["text"], "Hola")
+        self.assertEqual(preserved, original)
 
     def test_canonical_comment_is_consumed_without_false_second_precision(self):
         row = {

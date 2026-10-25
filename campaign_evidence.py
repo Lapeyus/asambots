@@ -198,8 +198,15 @@ def coverage(input_path: str, messages: Sequence[Message]) -> dict:
         with open(catalog, encoding="utf-8") as handle:
             for line in handle:
                 row = json.loads(line)
-                if row.get("video_id") in video_ids and row.get("published_at"):
-                    dates.append(str(row["published_at"])[:10])
+                if row.get("video_id") not in video_ids:
+                    continue
+                value = row.get("upload_date") or row.get("published_at")
+                if value:
+                    value = str(value)
+                    dates.append(
+                        "{}-{}-{}".format(value[:4], value[4:6], value[6:8])
+                        if len(value) == 8 and value.isdigit() else value[:10]
+                    )
     return {
         "videos_with_records": len(video_ids),
         "chat_sessions": len({message.session for message in messages if message.source == "chat"}),

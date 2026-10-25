@@ -6,6 +6,12 @@ chats/
 results/
 advanced_results/
 presidencia_data/
+asamblea_data/
+asamblea_analysis/
+asamblea_advanced_analysis/
+asamblea_campaign_analysis/
+asamblea_deep_analysis/
+asamblea_text_analysis/
 presidencia_analysis/
 campaign_analysis/
 deep_analysis/

@@ -32,6 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -39,15 +40,17 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from bot_detector import extract_run_text
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_CHANNEL = "https://www.youtube.com/@PresidenciadelaRepublicaCR"
 DEFAULT_SINCE = "2026-05-01"
+LEGACY_CHAT_RE = re.compile(r"__([A-Za-z0-9_-]{11})__chat\.jsonl$")
 API_BASE = "https://www.googleapis.com/youtube/v3"
 UNAVAILABLE_MARKERS = (
     "comments are disabled",
     "commentsdisabled",
     "chat is disabled",
     "chat replay is disabled",
+    "does not have a chat replay",
     "live chat replay is not available",
     "there are no subtitles for the requested languages",
     "subtitles for the requested languages are not available",
@@ -121,7 +124,10 @@ def parse_day(value: str) -> date:
 
 
 def entry_day(entry: dict) -> Optional[date]:
-    value = entry.get("published_at") or entry.get("upload_date")
+    # yt-dlp puede conservar un ``published_at`` aproximado (por ejemplo,
+    # 2026-05-01) aunque la hidratación ya haya obtenido ``upload_date`` exacto
+    # (por ejemplo, 2026-04-23). La fecha de subida debe tener precedencia.
+    value = entry.get("upload_date") or entry.get("published_at")
     if not value:
         return None
     try:
@@ -166,9 +172,15 @@ class Inventory:
     def ensure_video(self, entry: dict) -> dict:
         video = self.data["videos"].setdefault(entry["video_id"], {})
         video["metadata"] = dict(entry)
+        video["active_in_catalog"] = True
         video.setdefault("chat", {"status": "pending", "attempts": 0})
         video.setdefault("comments", {"status": "pending", "attempts": 0})
         return video
+
+    def set_active_video_ids(self, video_ids: Iterable[str]) -> None:
+        active = set(video_ids)
+        for video_id, video in self.data["videos"].items():
+            video["active_in_catalog"] = video_id in active
 
     def artifact_path(self, video_id: str, kind: str) -> Optional[Path]:
         state = self.data["videos"].get(video_id, {}).get(kind, {})
@@ -223,13 +235,14 @@ class Inventory:
 
     def mark(self, video_id: str, kind: str, status: str, reason: str) -> None:
         state = self.data["videos"][video_id][kind]
-        state.update({"status": status, "last_error": reason[:1000], "updated_at": utc_now()})
+        compact_reason = reason if len(reason) <= 1000 else reason[:450] + "\n...\n" + reason[-500:]
+        state.update({"status": status, "last_error": compact_reason, "updated_at": utc_now()})
 
     def save(self) -> None:
         self.data["updated_at"] = utc_now()
         self.data["counts"] = dict(Counter(
             state.get("status", "unknown")
-            for video in self.data["videos"].values()
+            for video in self.data["videos"].values() if video.get("active_in_catalog", True)
             for kind, state in video.items()
             if kind in {"chat", "comments"}
         ))
@@ -397,9 +410,9 @@ def discover_channel_ytdlp(channel_url: str, ytdlp: str, args: argparse.Namespac
 
 def hydrate_catalog_dates_ytdlp(entries: Sequence[dict], ytdlp: str, args: argparse.Namespace) -> List[dict]:
     """Reemplaza fechas aproximadas de pestaña por metadatos exactos del video."""
-    hydrated = []
     clients = ["android", "web,ios", "tv", "mweb", "web_embedded"]
-    for index, original in enumerate(entries, 1):
+
+    def hydrate_one(original: dict) -> dict:
         entry = dict(original)
         last_error = ""
         for client_index, client in enumerate(clients):
@@ -435,9 +448,14 @@ def hydrate_catalog_dates_ytdlp(entries: Sequence[dict], ytdlp: str, args: argpa
                 time.sleep(args.client_sleep)
         if entry.get("date_precision") != "exact":
             entry["date_hydration_error"] = last_error or "sin metadatos exactos"
-        hydrated.append(entry)
-        if index % 10 == 0 or index == len(entries):
-            print("    fechas exactas: {}/{}".format(index, len(entries)))
+        return entry
+
+    hydrated = []
+    with ThreadPoolExecutor(max_workers=args.metadata_workers) as executor:
+        for index, entry in enumerate(executor.map(hydrate_one, entries), 1):
+            hydrated.append(entry)
+            if index % 10 == 0 or index == len(entries):
+                print("    fechas exactas: {}/{}".format(index, len(entries)), flush=True)
     return hydrated
 
 
@@ -560,6 +578,58 @@ def download_comments_ytdlp(entry: dict, destination: Path, ytdlp: str, args: ar
     raise RuntimeError("yt-dlp comentarios: {}".format(message or "sin info JSON"))
 
 
+def process_comments_parallel(
+    entries: Sequence[dict], inventory: Inventory, root: Path,
+    comments_backend: str, api_key: Optional[str], ytdlp: str,
+    args: argparse.Namespace,
+) -> int:
+    """Descarga comentarios en paralelo y serializa las mutaciones del inventario."""
+    pending = []
+    touched = 0
+    for entry in entries:
+        if args.limit and touched >= args.limit:
+            break
+        video_id = entry["video_id"]
+        if not inventory.should_process(video_id, "comments", args.retry_unavailable):
+            continue
+        existing = inventory.artifact_path(video_id, "comments")
+        destination = existing or root / "comments" / artifact_filename(entry, "comments")
+        if existing is None and inventory.adopt(video_id, "comments", destination):
+            print("[=] comentarios existentes adoptados {}".format(video_id))
+            continue
+        inventory.attempt(video_id, "comments", comments_backend)
+        pending.append((entry, destination))
+        touched += 1
+    inventory.save()
+    print("[*] comentarios en cola: {} ({} trabajadores)".format(len(pending), args.comment_workers))
+
+    def download(item):
+        entry, destination = item
+        if comments_backend == "api":
+            count = download_comments_api(entry, destination, api_key)
+        else:
+            count = download_comments_ytdlp(entry, destination, ytdlp, args)
+        return entry, destination, count
+
+    with ThreadPoolExecutor(max_workers=args.comment_workers) as executor:
+        futures = {executor.submit(download, item): item for item in pending}
+        for future in as_completed(futures):
+            entry, destination = futures[future]
+            video_id = entry["video_id"]
+            try:
+                _, destination, count = future.result()
+                inventory.complete(video_id, "comments", destination, count, comments_backend)
+                print("[+] comentarios {}: {} ({})".format(video_id, count, entry.get("title", "")[:70]), flush=True)
+            except UnavailableError as exc:
+                inventory.mark(video_id, "comments", "unavailable", str(exc))
+                print("[=] comentarios {} no disponibles".format(video_id), flush=True)
+            except Exception as exc:
+                inventory.mark(video_id, "comments", "error", str(exc))
+                print("[!] comentarios {}: {}".format(video_id, str(exc)[-500:]), flush=True)
+            inventory.save()
+    return touched
+
+
 def canonical_chat_records(payload: dict, video_id: str) -> Iterator[dict]:
     replay = payload.get("replayChatItemAction", {})
     try:
@@ -605,6 +675,37 @@ def iter_raw_chat(path: Path, video_id: str) -> Iterator[dict]:
             except ValueError:
                 continue
             yield from canonical_chat_records(payload, video_id)
+
+
+def discover_legacy_chats(root: Path) -> Dict[str, Path]:
+    """Indexa exportaciones crudas cuyo video_id aparece en el nombre."""
+    if not root.is_dir():
+        raise RuntimeError("Directorio de chats heredados inexistente: {}".format(root))
+    indexed: Dict[str, Path] = {}
+    for path in sorted(root.rglob("*.jsonl")):
+        match = LEGACY_CHAT_RE.search(path.name)
+        if not match:
+            continue
+        video_id = match.group(1)
+        previous = indexed.get(video_id)
+        if previous is not None and previous.resolve() != path.resolve():
+            raise RuntimeError(
+                "Dos chats heredados para {}: {} y {}".format(video_id, previous, path)
+            )
+        indexed[video_id] = path
+    return indexed
+
+
+def import_legacy_chat(source: Path, destination: Path, video_id: str) -> int:
+    """Convierte una repetición cruda a JSONL canónico sin alterar la fuente."""
+    count = atomic_jsonl(destination, iter_raw_chat(source, video_id))
+    if count == 0:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise RuntimeError("El chat heredado no produjo mensajes canónicos: {}".format(source))
+    return count
 
 
 def chat_downloader_record(item: dict, video_id: str) -> dict:
@@ -714,8 +815,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-comments", default="all", help="all o maximo por video para yt-dlp")
     parser.add_argument("--sleep", type=float, default=5.0, help="pausa entre videos")
     parser.add_argument("--client-sleep", type=float, default=3.0, help="pausa al rotar clientes de chat")
+    parser.add_argument(
+        "--metadata-workers", type=int, default=4,
+        help="procesos simultáneos para verificar fechas exactas (predeterminado: 4)",
+    )
+    parser.add_argument(
+        "--comment-workers", type=int, default=1,
+        help="descargas simultáneas cuando --mode comments (predeterminado: 1)",
+    )
     parser.add_argument("--cookies")
     parser.add_argument("--cookies-from-browser", help="por ejemplo chrome o firefox")
+    parser.add_argument(
+        "--legacy-chat-dir",
+        help="directorio de chats crudos existentes; se importan por video_id antes de descargar",
+    )
+    parser.add_argument(
+        "--legacy-only", action="store_true",
+        help="importar únicamente chats presentes en --legacy-chat-dir, sin solicitudes remotas",
+    )
     parser.add_argument("--retry-unavailable", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -726,6 +843,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--since y --until deben usar YYYY-MM-DD")
     if args.since_day > args.until_day:
         parser.error("--since no puede ser posterior a --until")
+    if args.metadata_workers <= 0:
+        parser.error("--metadata-workers debe ser positivo")
+    if args.comment_workers <= 0:
+        parser.error("--comment-workers debe ser positivo")
+    if args.legacy_only and not args.legacy_chat_dir:
+        parser.error("--legacy-only requiere --legacy-chat-dir")
     if args.max_comments != "all":
         try:
             if int(args.max_comments) <= 0:
@@ -741,6 +864,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     root.mkdir(parents=True, exist_ok=True)
     catalog_path = root / "catalog.jsonl"
     inventory = Inventory(root / "inventory.json", root, args.channel, args.since, args.until)
+    legacy_chats = (
+        discover_legacy_chats(Path(args.legacy_chat_dir).resolve())
+        if args.legacy_chat_dir else {}
+    )
+    if legacy_chats:
+        print("[=] chats heredados indexados: {}".format(len(legacy_chats)))
     api_key = os.environ.get("YOUTUBE_API_KEY")
     catalog_backend = select_backend(args.catalog_backend, api_key)
     comments_backend = select_backend(args.comments_backend, api_key)
@@ -748,8 +877,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     scraping_needed = (
         (not args.no_refresh_catalog and catalog_backend == "ytdlp")
-        or args.mode in {"all", "chats"}
-        or (args.mode in {"all", "comments"} and comments_backend == "ytdlp")
+        or (args.mode in {"all", "chats"} and not args.legacy_only)
+        or (args.mode in {"all", "comments"} and comments_backend == "ytdlp" and not args.legacy_only)
     )
     if scraping_needed and os.environ.get("YOUTUBE_RASPADO") != "1":
         print("[!] Esta corrida requiere yt-dlp/raspado. Exporte YOUTUBE_RASPADO=1 conscientemente.")
@@ -766,6 +895,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not entries:
             print("[!] No existe catalogo local; quite --no-refresh-catalog")
             return 2
+        loaded_count = len(entries)
+        entries = [entry for entry in entries if within_window(entry, args.since_day, args.until_day)]
+        if len(entries) != loaded_count:
+            print("[=] catalogo local depurado por fecha: {} -> {}".format(loaded_count, len(entries)))
+            atomic_jsonl(catalog_path, entries)
     else:
         if catalog_backend == "api":
             entries = discover_channel_api(args.channel, api_key)
@@ -789,6 +923,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     for entry in entries:
         inventory.ensure_video(entry)
+    inventory.set_active_video_ids(entry["video_id"] for entry in entries)
     inventory.save()
     streams = sum(bool(entry.get("is_stream")) for entry in entries)
     print("[=] catalogo: {} videos, {} transmisiones, ventana {}..{}".format(
@@ -800,12 +935,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("    {} {} {}".format(entry_day(entry), entry["video_id"], entry.get("title", "")[:90]))
         return 0
 
+    if args.mode == "comments" and args.comment_workers > 1:
+        process_comments_parallel(
+            entries, inventory, root, comments_backend, api_key, ytdlp, args
+        )
+        inventory.save()
+        print("[=] inventario actualizado: {}".format(inventory.path))
+        return 0
+
     touched = 0
     for entry in entries:
         if args.limit and touched >= args.limit:
             print("[=] tope de {} videos; relance para continuar".format(args.limit))
             break
         video_id = entry["video_id"]
+        if args.legacy_only and video_id not in legacy_chats:
+            continue
         work_done = False
 
         if args.mode in {"all", "chats"}:
@@ -821,6 +966,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 destination = existing or root / "chats" / artifact_filename(entry, "chat")
                 if existing is None and inventory.adopt(video_id, "chat", destination):
                     print("[=] chat existente adoptado {}".format(video_id))
+                elif existing is None and video_id in legacy_chats:
+                    source = legacy_chats[video_id]
+                    inventory.attempt(video_id, "chat", "legacy_import")
+                    inventory.save()
+                    print("[*] importando chat heredado {} — {}".format(video_id, source.name))
+                    try:
+                        count = import_legacy_chat(source, destination, video_id)
+                        inventory.complete(video_id, "chat", destination, count, "legacy_import")
+                        chat_state = inventory.data["videos"][video_id]["chat"]
+                        chat_state["imported_from"] = str(source)
+                        chat_state["source_bytes"] = source.stat().st_size
+                        chat_state["source_sha256"] = sha256_file(source)
+                        print("    {} mensajes canónicos importados".format(count))
+                    except Exception as exc:
+                        inventory.mark(video_id, "chat", "error", str(exc))
+                        print("    [!] {}".format(exc))
+                    work_done = True
                 else:
                     inventory.attempt(video_id, "chat", "yt_dlp")
                     inventory.save()
@@ -837,7 +999,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         print("    [!] {}".format(exc))
                     work_done = True
 
-        if args.mode in {"all", "comments"} and inventory.should_process(video_id, "comments", args.retry_unavailable):
+        if (
+            not args.legacy_only and args.mode in {"all", "comments"}
+            and inventory.should_process(video_id, "comments", args.retry_unavailable)
+        ):
             existing = inventory.artifact_path(video_id, "comments")
             destination = existing or root / "comments" / artifact_filename(entry, "comments")
             if existing is None and inventory.adopt(video_id, "comments", destination):
